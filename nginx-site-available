@@ -1,0 +1,87 @@
+server {
+  listen 80;
+  server_name enter_your_domain;
+
+  if ($host != "enter_your_domain") {
+    return 403;
+  }
+
+  rewrite ^(.*) https://$host$1 permanent;
+}
+
+upstream enter_your_domain {
+  server 127.0.0.1:10000;
+}
+
+server {
+  listen 443 ssl http2;
+  server_name enter_your_domain;
+  proxy_read_timeout 720s;
+  proxy_connect_timeout 720s;
+  proxy_send_timeout 720s;
+
+  if ($host != "enter_your_domain") {
+    return 403;
+  }
+
+  # add Headers for odoo proxy mode
+  proxy_set_header Host                   $host;
+  proxy_set_header X-Forwarded-Host       $host;
+  proxy_set_header X-Forwarded-For        $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto      $scheme;
+  proxy_set_header X-Real-IP              $remote_addr;
+
+  # SSL parameters
+  ssl_certificate         /etc/letsencrypt/live/enter_your_domain/fullchain.pem;
+  ssl_certificate_key     /etc/letsencrypt/live/enter_your_domain/privkey.pem;
+  include                 /etc/letsencrypt/options-ssl-nginx.conf;
+  ssl_dhparam             /etc/letsencrypt/ssl-dhparams.pem;
+
+  # proxy logs
+  access_log      /var/log/nginx/odoo.enter_your_domain.access.log;
+  error_log       /var/log/nginx/odoo.enter_your_domain.error.log;
+
+  location / {
+    proxy_redirect off;
+    limit_except GET POST { deny all; }
+
+    proxy_pass http://enter_your_domain;
+  }
+
+  location ~* \.(js|css|png|jpg|jpeg|gif|ico)$ {
+    expires max;
+    log_not_found off;
+
+    proxy_pass http://enter_your_domain;
+  }
+
+  # Global restrictions configuration file.
+  # Designed to be included in any server {} block.
+  location = /favicon.ico {
+    log_not_found off;
+    access_log off;
+
+    proxy_pass http://enter_your_domain;
+  }
+
+  location = /robots.txt {
+    allow all;
+    log_not_found off;
+    access_log off;
+
+    proxy_pass http://enter_your_domain;
+  }
+
+  # Deny all attempts to access hidden files such as .htaccess, .htpasswd, .DS_Store (Mac).
+  # Keep logging the requests to parse later (or to pass to firewall utilities such as fail2ban)
+  location ~ /\. {
+    deny all;
+  }
+
+  # Deny access to any files with a .php extension in the uploads directory
+  # Works in sub-directory installs and also in multisite network
+  # Keep logging the requests to parse later (or to pass to firewall utilities such as fail2ban)
+  location ~* /(?:uploads|files)/.*\.php$ {
+    deny all;
+  }
+}

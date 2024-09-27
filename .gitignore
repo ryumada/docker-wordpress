@@ -1,0 +1,8 @@
+.env
+.vscode
+
+.secrets/*
+!.secrets/db_password.example
+
+db
+wordpress

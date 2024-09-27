@@ -1,0 +1,41 @@
+version: '3.1'
+
+services:
+
+  wordpress:
+    depends_on:
+      - db
+    image: wordpress
+    restart: always
+    ports:
+      - 10000:80
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_NAME: $WORDPRESS_DB_NAME
+      WORDPRESS_DB_USER: $WORDPRESS_DB_USER
+      WORDPRESS_DB_PASSWORD: $(cat /run/secrets/db_password)
+    env_file:
+      - .env
+    volumes:
+      - ./wordpress:/var/www/html
+    secrets:
+      - db_password
+
+  db:
+    image: mysql:8.0
+    restart: always
+    environment:
+      MYSQL_DATABASE: $WORDPRESS_DB_NAME
+      MYSQL_USER: $WORDPRESS_DB_USER
+      MYSQL_PASSWORD: $(cat /run/secrets/db_password)
+      MYSQL_RANDOM_ROOT_PASSWORD: '1'
+    env_file:
+      - .env
+    volumes:
+      - ./db:/var/lib/mysql
+    secrets:
+      - db_password
+
+secrets:
+  db_password:
+    file: ./.secrets/db_password

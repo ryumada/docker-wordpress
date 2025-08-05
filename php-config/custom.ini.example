@@ -1,0 +1,17 @@
+; Set the maximum size for uploaded files.
+upload_max_filesize = 3G
+
+; Set the maximum size of POST data.
+; This must be equal to or greater than upload_max_filesize.
+post_max_size = 3G
+
+; Set the maximum amount of memory a script can consume.
+; Setting this higher than post_max_size is a good practice.
+memory_limit = 4G
+
+; Set the maximum execution time for the script.
+; Uploading a 3GB file will take a very long time.
+max_execution_time = 7200
+
+; Set the maximum time a script is allowed to parse input data.
+max_input_time = 7200

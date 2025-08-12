@@ -102,6 +102,13 @@ The `php-config/custom.ini.example` file shows how to easily customize PHP setti
 
 ---
 
+## Scripts
+
+update_env_file.sh
+This script provides a safe and easy way to update your .env file when the .env.example template changes. It works by first backing up your existing .env file to .env.bak, then creating a new .env file from the latest .env.example template, and finally merging all the variables and values from the backup file back into the new one. This ensures you can easily add new environment variables without losing your existing configurations.
+
+---
+
 ## File Structure
 
 ```

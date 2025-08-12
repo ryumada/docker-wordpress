@@ -50,7 +50,6 @@ For security, this setup uses a Docker secret to manage the database password.
 
 Create the secret file:
 ```bash
-mkdir -p .secrets
 cp .secrets/db_password.example .secrets/db_password
 ```
 Now, edit the `db_password` file and replace `enter_your_db_password` with a strong password. **Do not add this file to your version control.**
@@ -63,6 +62,25 @@ With your configuration files ready, start the services using Docker Compose:
 docker-compose up -d
 ```
 The `-d` flag runs the containers in detached mode.
+
+### Important: Port Mapping in `docker-compose.yml`
+
+The `docker-compose.yml` file is configured to work with either the `apache` or `fpm` WordPress images, but you must manually uncomment the correct port mapping.
+
+For the `apache` image: Use `- ${WORDPRESS_PORT}:80`. This maps the host port to Apache's default port inside the container.
+
+For the `fpm` image: Use `- ${WORDPRESS_PORT}:9000`. This maps the host port to the PHP-FPM service's default port, which requires a separate web server (like Nginx on your host machine) to forward requests.
+
+### Example docker-compose.yml ports section:
+
+```docker
+    # The port mapping depends on the image you choose in the .env file.
+    ports:
+      # For the 'apache' image, uncomment the line below.
+      # - ${WORDPRESS_PORT}:80
+      # For the 'fpm' image, uncomment the line below.
+      - ${WORDPRESS_PORT}:9000
+```
 
 ### Step 4: Configure Nginx (Optional but Recommended)
 
@@ -104,7 +122,8 @@ The `php-config/custom.ini.example` file shows how to easily customize PHP setti
 
 ## Scripts
 
-update_env_file.sh
+`update_env_file.sh`
+
 This script provides a safe and easy way to update your .env file when the .env.example template changes. It works by first backing up your existing .env file to .env.bak, then creating a new .env file from the latest .env.example template, and finally merging all the variables and values from the backup file back into the new one. This ensures you can easily add new environment variables without losing your existing configurations.
 
 ---

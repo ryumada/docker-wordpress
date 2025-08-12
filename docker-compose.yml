@@ -6,7 +6,10 @@ services:
     image: wordpress:${WORDPRESS_IMAGE_TAG}
     restart: always
     ports:
-      - ${WORDPRESS_PORT}:80
+      # For the 'fpm' image, uncomment the line below.
+      - ${WORDPRESS_PORT}:9000
+      # For the 'apache' image, uncomment the line below.
+      # - ${WORDPRESS_PORT}:80
     environment:
       WORDPRESS_DB_HOST: db
       WORDPRESS_DB_NAME: $WORDPRESS_DB_NAME

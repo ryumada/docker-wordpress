@@ -3,7 +3,7 @@ services:
   wordpress:
     depends_on:
       - db
-    image: wordpress
+    image: wordpress:${WORDPRESS_IMAGE_TAG}
     restart: always
     ports:
       - ${WORDPRESS_PORT}:80

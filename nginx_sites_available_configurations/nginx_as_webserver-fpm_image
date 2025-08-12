@@ -1,0 +1,67 @@
+upstream enter_your_domain {
+    server 127.0.0.1:enter_wordpress_port;
+}
+
+server {
+    listen 80;
+    server_name enter_your_domain;
+
+    if ($host != "enter_your_domain") {
+        return 403;
+    }
+
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name enter_your_domain;
+
+    if ($host != "enter_your_domain") {
+        return 403;
+    }
+
+    # SSL configuration for Let's Encrypt
+    ssl_certificate         /etc/letsencrypt/live/enter_your_domain/fullchain.pem;
+    ssl_certificate_key     /etc/letsencrypt/live/enter_your_domain/privkey.pem;
+    include                 /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam             /etc/letsencrypt/ssl-dhparams.pem;
+
+    # Nginx proxy headers to pass client information to the WordPress application
+    proxy_set_header Host                $host;
+    proxy_set_header X-Forwarded-Host    $host;
+    proxy_set_header X-Forwarded-For     $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto   $scheme;
+    proxy_set_header X-Real-IP           $remote_addr;
+
+    # Proxy logs
+    access_log      /var/log/nginx/enter_your_domain.access.log;
+    error_log       /var/log/nginx/enter_your_domain.error.log;
+
+    location / {
+        try_files $uri $uri/ /index.php?$args;
+    }
+
+    # This location block is for handling all PHP files.
+    location ~ \.php$ {
+        # This prevents Nginx from trying to process requests for non-existent PHP files
+        try_files $uri =404;
+
+        # These are crucial settings to pass the request to the FPM service.
+        fastcgi_split_path_info ^(.+\.php)(/.+)$;
+        fastcgi_pass enter_your_domain;
+        fastcgi_index index.php;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+        fastcgi_param PATH_INFO $fastcgi_path_info;
+    }
+
+    # Global restrictions and security
+    location ~ /\. {
+        deny all;
+    }
+
+    location ~* /(?:uploads|files)/.*\.php$ {
+        deny all;
+    }
+}

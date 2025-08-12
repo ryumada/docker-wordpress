@@ -1,3 +1,7 @@
+upstream enter_your_domain {
+  server 127.0.0.1:enter_wordpress_port;
+}
+
 server {
   listen 80;
   server_name enter_your_domain;
@@ -6,11 +10,7 @@ server {
     return 403;
   }
 
-  rewrite ^(.*) https://$host$1 permanent;
-}
-
-upstream enter_your_domain {
-  server 127.0.0.1:10000;
+  return 301 https://$host$request_uri;
 }
 
 server {
@@ -24,6 +24,12 @@ server {
     return 403;
   }
 
+  # SSL parameters
+  ssl_certificate         /etc/letsencrypt/live/enter_your_domain/fullchain.pem;
+  ssl_certificate_key     /etc/letsencrypt/live/enter_your_domain/privkey.pem;
+  include                 /etc/letsencrypt/options-ssl-nginx.conf;
+  ssl_dhparam             /etc/letsencrypt/ssl-dhparams.pem;
+
   # add Headers for odoo proxy mode
   proxy_set_header Host                   $host;
   proxy_set_header X-Forwarded-Host       $host;
@@ -31,20 +37,12 @@ server {
   proxy_set_header X-Forwarded-Proto      $scheme;
   proxy_set_header X-Real-IP              $remote_addr;
 
-  # SSL parameters
-  ssl_certificate         /etc/letsencrypt/live/enter_your_domain/fullchain.pem;
-  ssl_certificate_key     /etc/letsencrypt/live/enter_your_domain/privkey.pem;
-  include                 /etc/letsencrypt/options-ssl-nginx.conf;
-  ssl_dhparam             /etc/letsencrypt/ssl-dhparams.pem;
-
   # proxy logs
-  access_log      /var/log/nginx/odoo.enter_your_domain.access.log;
-  error_log       /var/log/nginx/odoo.enter_your_domain.error.log;
+  access_log      /var/log/nginx/enter_your_domain.access.log;
+  error_log       /var/log/nginx/enter_your_domain.error.log;
 
   location / {
     proxy_redirect off;
-    limit_except GET POST { deny all; }
-
     proxy_pass http://enter_your_domain;
   }
 

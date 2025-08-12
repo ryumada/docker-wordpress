@@ -18,7 +18,7 @@ services:
     env_file:
       - .env
     volumes:
-      - ./wordpress:/var/www/html
+      - ./data/wordpress:/var/www/html
       - ./php-config/custom.ini:/usr/local/etc/php/conf.d/custom.ini
     secrets:
       - db_password
@@ -34,7 +34,7 @@ services:
     env_file:
       - .env
     volumes:
-      - ./db:/var/lib/mysql
+      - ./data/db:/var/lib/mysql
     secrets:
       - db_password
 

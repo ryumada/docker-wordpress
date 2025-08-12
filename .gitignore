@@ -4,6 +4,6 @@
 .secrets/*
 !.secrets/db_password.example
 
-db
-wordpress
+data
+!data/README.md
 php-config/custom.ini

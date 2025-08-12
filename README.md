@@ -67,20 +67,31 @@ The `-d` flag runs the containers in detached mode.
 
 The `docker-compose.yml` file is configured to work with either the `apache` or `fpm` WordPress images, but you must manually uncomment the correct port mapping.
 
-For the `apache` image: Use `- ${WORDPRESS_PORT}:80`. This maps the host port to Apache's default port inside the container.
-
-For the `fpm` image: Use `- ${WORDPRESS_PORT}:9000`. This maps the host port to the PHP-FPM service's default port, which requires a separate web server (like Nginx on your host machine) to forward requests.
+- For the `apache` image: Use `- ${WORDPRESS_PORT}:80`. This maps the host port to Apache's default port inside the container.
+- For the `fpm` image: Use `- ${WORDPRESS_PORT}:9000`. This maps the host port to the PHP-FPM service's default port, which requires a separate web server (like Nginx on your host machine) to forward requests.
 
 ### Example docker-compose.yml ports section:
 
 ```docker
-    # The port mapping depends on the image you choose in the .env file.
-    ports:
-      # For the 'apache' image, uncomment the line below.
-      # - ${WORDPRESS_PORT}:80
-      # For the 'fpm' image, uncomment the line below.
-      - ${WORDPRESS_PORT}:9000
+# The port mapping depends on the image you choose in the .env file.
+ports:
+  # For the 'apache' image, uncomment the line below.
+  # - ${WORDPRESS_PORT}:80
+  # For the 'fpm' image, uncomment the line below.
+  - ${WORDPRESS_PORT}:9000
 ```
+
+### Consistent Volume Mounts for Both Images
+
+A key benefit of this setup is that the volume mounts for your files remain the same, regardless of whether you're using the Apache or FPM image.
+
+- **Custom PHP Configuration**: The `php-config/custom.ini` file is always mounted to `/usr/local/etc/php/conf.d/custom.ini` inside the container. Both Apache and FPM images are configured to automatically load `.ini` files from this location, so your custom PHP settings will always be applied.
+
+- **WordPress Files**: The core WordPress files, including your themes, plugins, and uploads, are consistently located at `/var/www/html` inside the container. The `docker-compose.yml` file mounts your local `./wordpress` directory to this location.
+
+- **Database Files**: The MySQL database files are consistently located at `/var/lib/mysql` inside the container. The `docker-compose.yml` file now mounts your local `./data/db` directory to this location.
+
+This consistency makes switching between image types simple and seamless.
 
 ### Step 4: Configure Nginx (Optional but Recommended)
 
@@ -124,7 +135,7 @@ The `php-config/custom.ini.example` file shows how to easily customize PHP setti
 
 `update_env_file.sh`
 
-This script provides a safe and easy way to update your .env file when the .env.example template changes. It works by first backing up your existing .env file to .env.bak, then creating a new .env file from the latest .env.example template, and finally merging all the variables and values from the backup file back into the new one. This ensures you can easily add new environment variables without losing your existing configurations.
+This script provides a safe and easy way to update your `.env` file when the `.env.example` template changes. It works by first backing up your existing `.env` file to `.env.bak`, then creating a new `.env` file from the latest `.env.example` template, and finally merging all the variables and values from the backup file back into the new one. This ensures you can easily add new environment variables without losing your existing configurations.
 
 ---
 
@@ -136,6 +147,9 @@ This script provides a safe and easy way to update your .env file when the .env.
 ├── .gitignore
 ├── .secrets/
 │   └── db_password.example
+├── data/
+│   ├── wordpress/
+│   └── db/
 ├── docker-compose.yml
 ├── LICENSE
 ├── nginx_sites_available_configurations/
@@ -145,7 +159,8 @@ This script provides a safe and easy way to update your .env file when the .env.
 │   └── custom.ini.example
 └── scripts/
     ├── install_nginx_default_deny.sh
-    └── install_ssl_dhparams_key.sh
+    ├── install_ssl_dhparams_key.sh
+    └── update_env_file.sh
 ```
 
 ---

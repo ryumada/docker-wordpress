@@ -1,67 +1,78 @@
-upstream enter_your_domain {
-    server 127.0.0.1:enter_wordpress_port;
+# This upstream block defines the location of your PHP-FPM service.
+# Replace 'enter_your_domain-wordpress' with a descriptive name for your service.
+upstream enter_your_domain-wordpress {
+  # This is the IP and port of your PHP-FPM container.
+  server 127.0.0.1:enter_wordpress_port;
 }
 
+# This server block listens on port 80 and redirects all HTTP traffic to HTTPS.
 server {
-    listen 80;
-    server_name enter_your_domain;
+  listen 80;
+  server_name enter_your_domain;
 
-    if ($host != "enter_your_domain") {
-        return 403;
-    }
+  # This security check ensures that only requests for your domain are processed.
+  if ($host != "enter_your_domain") {
+    return 403;
+  }
 
-    return 301 https://$host$request_uri;
+  return 301 https://$host$request_uri;
 }
 
+# This is the main server block for handling HTTPS traffic.
 server {
-    listen 443 ssl http2;
-    server_name enter_your_domain;
+  listen 443 ssl http2;
+  server_name enter_your_domain;
 
-    if ($host != "enter_your_domain") {
-        return 403;
-    }
+  # Another security check for HTTPS.
+  if ($host != "enter_your_domain") {
+    return 403;
+  }
 
-    # SSL configuration for Let's Encrypt
-    ssl_certificate         /etc/letsencrypt/live/enter_your_domain/fullchain.pem;
-    ssl_certificate_key     /etc/letsencrypt/live/enter_your_domain/privkey.pem;
-    include                 /etc/letsencrypt/options-ssl-nginx.conf;
-    ssl_dhparam             /etc/letsencrypt/ssl-dhparams.pem;
+  # The 'root' directive MUST point to the full path of your website's files
+  # on the host machine's filesystem.
+  # ex. /opt/mywebsite/data/wordpress
+  root enter_path_to_wordpress_data;
+  index index.php index.html index.htm;
 
-    # Nginx proxy headers to pass client information to the WordPress application
-    proxy_set_header Host                $host;
-    proxy_set_header X-Forwarded-Host    $host;
-    proxy_set_header X-Forwarded-For     $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto   $scheme;
-    proxy_set_header X-Real-IP           $remote_addr;
+  # SSL configuration, replace these with your own certificate paths.
+  ssl_certificate         /etc/letsencrypt/live/enter_your_domain/fullchain.pem;
+  ssl_certificate_key     /etc/letsencrypt/live/enter_your_domain/privkey.pem;
+  include                 /etc/letsencrypt/options-ssl-nginx.conf;
+  ssl_dhparam             /etc/letsencrypt/ssl-dhparams.pem;
 
-    # Proxy logs
-    access_log      /var/log/nginx/enter_your_domain.access.log;
-    error_log       /var/log/nginx/enter_your_domain.error.log;
+  # Proxy logs, adjust the path and filename as needed.
+  access_log      /var/log/nginx/enter_your_domain.access.log;
+  error_log       /var/log/nginx/enter_your_domain.error.log;
 
-    location / {
-        try_files $uri $uri/ /index.php?$args;
-    }
+  # This location block is the default catch-all for all non-specific requests.
+  location / {
+    # Tries to find the file, then directory, then falls back to index.php.
+    try_files $uri $uri/ /index.php?$args;
+  }
 
-    # This location block is for handling all PHP files.
-    location ~ \.php$ {
-        # This prevents Nginx from trying to process requests for non-existent PHP files
-        try_files $uri =404;
+  # This location block handles all PHP files by passing them to PHP-FPM.
+  location ~ \.php$ {
+    try_files $uri =404;
 
-        # These are crucial settings to pass the request to the FPM service.
-        fastcgi_split_path_info ^(.+\.php)(/.+)$;
-        fastcgi_pass enter_your_domain;
-        fastcgi_index index.php;
-        include fastcgi_params;
-        fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-        fastcgi_param PATH_INFO $fastcgi_path_info;
-    }
+    fastcgi_split_path_info ^(.+\.php)(/.+)$;
+    # This must match the name of the upstream block defined at the top.
+    fastcgi_pass enter_your_domain-wordpress;
+    fastcgi_index index.php;
+    include fastcgi_params;
 
-    # Global restrictions and security
-    location ~ /\. {
-        deny all;
-    }
+    # The SCRIPT_FILENAME MUST be the path to the website's files [IMPORTANT!!!]
+    # as seen from INSIDE the Docker container's filesystem.
+    # The default for wordpress is '/var/www/html'
+    fastcgi_param SCRIPT_FILENAME /var/www/html$fastcgi_script_name;
+    fastcgi_param PATH_INFO $fastcgi_path_info;
+  }
 
-    location ~* /(?:uploads|files)/.*\.php$ {
-        deny all;
-    }
+  # Global restrictions for security.
+  location ~ /\. {
+    deny all;
+  }
+
+  location ~* /(?:uploads|files)/.*\.php$ {
+    deny all;
+  }
 }

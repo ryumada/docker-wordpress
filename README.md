@@ -125,7 +125,20 @@ sudo systemctl reload nginx
 
 ---
 
-## Customizing PHP
+---
+
+## Customizing WordPress
+
+### Environment Constants
+
+You can add custom PHP `define` statements to your `wp-config.php` file using the `WORDPRESS_CONFIG_EXTRA` variable in your `.env` file. This is useful for setting constants like `WP_HOME`, `WP_SITEURL`, or toggling debug settings.
+
+Example for setting site URLs:
+```bash
+WORDPRESS_CONFIG_EXTRA="define('WP_HOME', 'https://example.com/blog'); define('WP_SITEURL', 'https://example.com/blog');"
+```
+
+### Customizing PHP
 
 The `php-config/custom.ini.example` file shows how to easily customize PHP settings like `upload_max_filesize` and `memory_limit`. The `docker-compose.yml` file already mounts this directory, so any changes you make to `php-config/custom.ini` will be applied to the WordPress container upon restart.
 

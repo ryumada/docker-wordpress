@@ -7,3 +7,19 @@
 data
 !data/README.md
 php-config/custom.ini
+
+# Installed machine-specific script instances
+scripts/snapshot-*.sh
+scripts/snapshot-*
+scripts/backupdata-*.sh
+scripts/backupdata-*
+scripts/restore_backupdata-*.sh
+scripts/restore_backupdata-*
+
+# Temporary and backup archives
+*.tar.zst
+*.tar.gz
+*.zip
+.env.bak
+.env.backup*
+.env.pre-restore

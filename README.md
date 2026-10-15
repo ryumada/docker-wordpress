@@ -144,11 +144,31 @@ The `php-config/custom.ini.example` file shows how to easily customize PHP setti
 
 ---
 
+---
+
+## Backup & Snapshot Utilities
+
+This deployment includes a full suite of backup, restore, and snapshot utilities modeled after the enterprise-grade backup architecture from `docker-odoo`.
+
+- **Full Deployment Snapshot (`scripts/snapshot-docker-wordpress.sh`)**: Creates a complete compressed `.tar.zst` archive including MySQL database dump, `data/wordpress` files, `.env`, `.secrets`, `docker-compose.yml`, PHP and Nginx configurations, metadata (`manifest.json`), and git commit hashes.
+- **Focused Data Backup (`scripts/backupdata-docker-wordpress.sh`)**: Fast zip archive containing MySQL database dump and `data/wordpress`.
+- **Snapshot & Data Restoration (`scripts/restore-snapshot.sh` & `scripts/restore_backupdata-docker-wordpress.sh`)**: Fast `--data-only` restore or full environment rollback with container coordination.
+- **Google Drive & Cloud Storage Integration**: Direct upload and retention management (`list-snapshot.sh`, `download-snapshot.sh`, `upload-snapshot.sh`, `cleanup-snapshot.sh`, `upload-temp-snapshots.sh`).
+- **Secondary VPS Remote Offloading**: Push backups offsite using passwordless SSH keys (`generate-snapshot-ssh-key.sh`).
+- **Automated Cron & Logrotate**: Scheduled backups with system-wide symlinks (`/usr/local/sbin/snapshot-docker-wordpress`).
+
+For detailed documentation, configuration options, and command references, see [scripts/README.md](scripts/README.md).
+
+---
+
 ## Scripts
 
-`update_env_file.sh`
-
-This script provides a safe and easy way to update your `.env` file when the `.env.example` template changes. It works by first backing up your existing `.env` file to `.env.bak`, then creating a new `.env` file from the latest `.env.example` template, and finally merging all the variables and values from the backup file back into the new one. This ensures you can easily add new environment variables without losing your existing configurations.
+- `update_env_file.sh`: Safely updates your `.env` file from `.env.example` while preserving existing configuration values.
+- `install_nginx_default_deny.sh`: Sets up a secure Nginx `default-deny` configuration.
+- `install_ssl_dhparams_key.sh`: Generates a Diffie-Hellman key for enhanced SSL security.
+- `restore-snapshot.sh`: Restores WordPress deployment snapshots.
+- `list-snapshot.sh`, `download-snapshot.sh`, `upload-snapshot.sh`, `cleanup-snapshot.sh`, `upload-temp-snapshots.sh`, `generate-snapshot-ssh-key.sh`: Google Drive and secondary VPS snapshot management tools.
+- `scripts/installer/`: Contains automated installers for snapshot, backupdata, restore, and sudoers rules.
 
 ---
 
@@ -171,9 +191,30 @@ This script provides a safe and easy way to update your `.env` file when the `.e
 ├── php-config/
 │   └── custom.ini.example
 └── scripts/
+    ├── example/
+    │   ├── backupdata.sh.example
+    │   ├── restore_backupdata.sh.example
+    │   └── snapshot.sh.example
+    ├── installer/
+    │   ├── install-backupdata.sh
+    │   ├── install-restore_backupdata.sh
+    │   ├── install-snapshot.sh
+    │   ├── install_sudoers.sh
+    │   └── uninstall-snapshot.sh
+    ├── lib/
+    │   ├── ssh_utils.sh
+    │   └── wp_utils.sh
+    ├── cleanup-snapshot.sh
+    ├── download-snapshot.sh
+    ├── generate-snapshot-ssh-key.sh
     ├── install_nginx_default_deny.sh
     ├── install_ssl_dhparams_key.sh
-    └── update_env_file.sh
+    ├── list-snapshot.sh
+    ├── README.md
+    ├── restore-snapshot.sh
+    ├── update_env_file.sh
+    ├── upload-snapshot.sh
+    └── upload-temp-snapshots.sh
 ```
 
 ---

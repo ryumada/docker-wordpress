@@ -1,0 +1,777 @@
+#!/usr/bin/env bash
+set -e
+# Category: Utility
+# Description: Creates a full WordPress snapshot (MySQL dump + data/wordpress + configs) locally or via secondary VPS over SSH.
+# Usage: ./scripts/snapshot-SERVICE_NAME.sh [auto]
+# Dependencies: sudo, git, zstd, tar, docker, rsync, ssh, curl, dd, flock, 7z, ionice
+
+CURRENT_DIR=$(dirname "$(readlink -f "$0")")
+CURRENT_DIR_USER=$(stat -c '%U' "$CURRENT_DIR")
+PATH_TO_WP=$(sudo -u "$CURRENT_DIR_USER" git -C "$(dirname "$(readlink -f "$0")")" rev-parse --show-toplevel 2>/dev/null || git -C "$(dirname "$(readlink -f "$0")")" rev-parse --show-toplevel 2>/dev/null || dirname "$CURRENT_DIR")
+SERVICE_NAME=$(basename "$PATH_TO_WP")
+REPOSITORY_OWNER=$(stat -c '%U' "$PATH_TO_WP" 2>/dev/null || echo "$USER")
+OWNER_HOME=$(eval echo "~$REPOSITORY_OWNER" 2>/dev/null || echo "$HOME")
+[ -z "$OWNER_HOME" ] && OWNER_HOME="$HOME"
+TAR_PROJECT_ROOT="${PATH_TO_WP#/}"
+
+# Source helper libraries if available
+if [ -f "$CURRENT_DIR/lib/wp_utils.sh" ]; then
+  # shellcheck source=/dev/null
+  source "$CURRENT_DIR/lib/wp_utils.sh"
+elif [ -f "$PATH_TO_WP/scripts/lib/wp_utils.sh" ]; then
+  # shellcheck source=/dev/null
+  source "$PATH_TO_WP/scripts/lib/wp_utils.sh"
+fi
+
+# --- Logging Functions & Colors ---
+COLOR_RESET="\033[0m"
+COLOR_INFO="\033[0;34m"
+COLOR_SUCCESS="\033[0;32m"
+COLOR_WARN="\033[0;33m"
+COLOR_ERROR="\033[0;31m"
+
+log() {
+  local color="$1"
+  local emoji="$2"
+  local message="$3"
+  echo -e "${color}[$(date +"%Y-%m-%d %H:%M:%S")] ${emoji} ${message}${COLOR_RESET}"
+}
+
+log_info() { log "${COLOR_INFO}" "ℹ️" "$1"; }
+log_success() { log "${COLOR_SUCCESS}" "✅" "$1"; }
+log_warn() { log "${COLOR_WARN}" "⚠️" "$1"; }
+log_error() { log "${COLOR_ERROR}" "❌" "$1"; }
+
+# --- Database & Container Operations ---
+is_mysql_container_running() {
+  local compose_file="$PATH_TO_WP/docker-compose.yml"
+  [ ! -f "$compose_file" ] && return 1
+  local cid
+  cid=$(docker compose -f "$compose_file" ps -q db 2>/dev/null || true)
+  if [ -n "$cid" ] && [ "$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)" = "true" ]; then
+    return 0
+  fi
+  return 1
+}
+
+ensure_mysql_container_running() {
+  local compose_file="$PATH_TO_WP/docker-compose.yml"
+  if ! is_mysql_container_running; then
+    log_info "Starting database container 'db'..."
+    docker compose -f "$compose_file" up -d db
+    log_info "Waiting for MySQL database service to become ready..."
+    local attempts=0
+    local max_attempts=30
+    while [ $attempts -lt $max_attempts ]; do
+      if docker compose -f "$compose_file" exec -T db sh -c 'mysqladmin ping -h localhost --silent' 2>/dev/null; then
+        log_success "MySQL database is ready."
+        return 0
+      fi
+      sleep 2
+      attempts=$((attempts + 1))
+    done
+    log_error "MySQL database did not become ready in time."
+    return 1
+  fi
+  return 0
+}
+
+run_mysql_dump() {
+  local db_name="$1"
+  local compose_file="$PATH_TO_WP/docker-compose.yml"
+  local env_file="$PATH_TO_WP/.env"
+
+  if [ -z "$db_name" ]; then
+    db_name=$(grep "^WORDPRESS_DB_NAME=" "$env_file" 2>/dev/null | cut -d '=' -f2- | sed 's/[[:space:]]*#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^["'\'']//;s/["'\'']$//')
+  fi
+
+  local db_user
+  db_user=$(grep "^WORDPRESS_DB_USER=" "$env_file" 2>/dev/null | cut -d '=' -f2- | sed 's/[[:space:]]*#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^["'\'']//;s/["'\'']$//')
+  [ -z "$db_user" ] && db_user="wordpress"
+
+  ensure_mysql_container_running
+
+  docker compose -f "$compose_file" exec -T db sh -c '
+    if [ -f /run/secrets/db_password ]; then
+      PASS=$(cat /run/secrets/db_password)
+    else
+      PASS="$MYSQL_PASSWORD"
+    fi
+    MYSQL_PWD="$PASS" exec mysqldump -u "'"$db_user"'" --single-transaction --quick --routines --triggers "'"$db_name"'"
+  '
+}
+
+extract_wp_version() {
+  local version_file="$PATH_TO_WP/data/wordpress/wp-includes/version.php"
+  if [ -f "$version_file" ]; then
+    local ver
+    ver=$(grep "\$wp_version\s*=" "$version_file" 2>/dev/null | head -n 1 | cut -d "'" -f 2 | tr -d '\r\n')
+    if [ -n "$ver" ]; then
+      echo "$ver"
+      return 0
+    fi
+  fi
+
+  local env_file="$PATH_TO_WP/.env"
+  local img_tag
+  img_tag=$(grep "^WORDPRESS_IMAGE_TAG=" "$env_file" 2>/dev/null | cut -d '=' -f2- | sed 's/[[:space:]]*#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^["'\'']//;s/["'\'']$//' || true)
+  if [ -n "$img_tag" ]; then
+    echo "$img_tag"
+    return 0
+  fi
+
+  echo "unknown"
+}
+
+areYouReallySure() {
+  local tar_file_path="$1"
+  local ask_replace="$2"
+  if [ -f "$tar_file_path" ]; then
+    if [ "$ask_replace" = "Y" ]; then
+      echo "Current snapshot file already exists, do you want to overwrite it? ($tar_file_path)"
+      echo -e "Type 'yes I am sure' to continue.\n"
+      read -rp ": " CONFIRMATION
+      case $CONFIRMATION in
+        "yes I am sure")
+          log_info "Overwriting the current snapshot file."
+          rm -f "$tar_file_path"
+          ;;
+        *)
+          log_error "Confirmation not provided. Exiting."
+          exit 1
+          ;;
+      esac
+    else
+      log_info "Removing the existing snapshot file."
+      rm -f "$tar_file_path"
+    fi
+  fi
+}
+
+getGitHash() {
+  local git_path=$1
+  local output_file=$2
+  local git_real_owner
+  git_real_owner=$(stat -c '%U' "$git_path" 2>/dev/null || echo "$REPOSITORY_OWNER")
+
+  {
+      echo "  Updated at [$(date +"%Y-%m-%d %H:%M:%S")]"
+      echo "  Git Directory: $git_path"
+      echo "  Git Remote: $(sudo -u "$git_real_owner" git -C "$git_path" config --get remote.origin.url 2>/dev/null || echo "N/A")"
+      echo "  Git Branch: $(sudo -u "$git_real_owner" git -C "$git_path" branch --show-current 2>/dev/null || echo "HEAD")"
+      echo "  Git Hashes: $(sudo -u "$git_real_owner" git -C "$git_path" rev-parse HEAD 2>/dev/null || echo "N/A")"
+      echo ""
+  } >> "$output_file"
+}
+
+writeGitHash() {
+  local search_dir=$1
+  local output_file=$2
+  [ -d "$search_dir" ] || return 0
+  if [ -e "$search_dir/.git" ]; then
+    getGitHash "$search_dir" "$output_file"
+  fi
+}
+
+moveSnapshotFileToTempDir() {
+  local tar_file_path=$1
+  local tar_file_name=$2
+
+  local snapshot_archive_dir="$OWNER_HOME/.wordpress-snapshots/$SERVICE_NAME/archives"
+  mkdir -p "$snapshot_archive_dir" 2>/dev/null || true
+  chmod 700 "$OWNER_HOME/.wordpress-snapshots" "$snapshot_archive_dir" 2>/dev/null || true
+
+  local dest_dir
+  dest_dir="$snapshot_archive_dir/$tar_file_name-$(date +"%Y%m%d-%H%M%S")"
+  if ! OUTPUT_mkdir=$(mkdir -p "$dest_dir" 2>&1); then
+    log_error "Can't create the archive directory: $OUTPUT_mkdir"
+    exit 1
+  fi
+
+  log_info "Moving the snapshot file to $dest_dir/..."
+  mv "$tar_file_path" "$dest_dir/$tar_file_name"
+
+  chmod 755 "$dest_dir" 2>/dev/null || true
+  chmod 644 "$dest_dir/$tar_file_name" 2>/dev/null || true
+  chown -R "$REPOSITORY_OWNER":"$REPOSITORY_OWNER" "$dest_dir" 2>/dev/null || true
+
+  # Also place/link at $OWNER_HOME for immediate access
+  ln -sf "$dest_dir/$tar_file_name" "$OWNER_HOME/$tar_file_name" 2>/dev/null || cp -f "$dest_dir/$tar_file_name" "$OWNER_HOME/$tar_file_name" 2>/dev/null || true
+
+  log_success "Snapshot created successfully: $tar_file_name. Archived at $dest_dir/$tar_file_name"
+}
+
+# --- Google Drive API Integration ---
+get_gdrive_access_token_from_sa() {
+  local sa_input="$1"
+  local sa_json_content=""
+
+  if [ -f "$sa_input" ]; then
+    sa_json_content=$(cat "$sa_input")
+  elif [[ "$sa_input" =~ ^\{.*\}$ ]]; then
+    sa_json_content="$sa_input"
+  else
+    log_error "Service Account JSON key file or content '$sa_input' not found."
+    return 1
+  fi
+
+  local client_email token_uri key_pem
+  client_email=$(echo "$sa_json_content" | grep -o '"client_email": *"[^"]*"' | cut -d'"' -f4)
+  token_uri=$(echo "$sa_json_content" | grep -o '"token_uri": *"[^"]*"' | cut -d'"' -f4)
+  [ -z "$token_uri" ] && token_uri="https://oauth2.googleapis.com/token"
+
+  key_pem=$(echo "$sa_json_content" | grep -o '"private_key": *"[^"]*"' | sed 's/^"private_key": *"//;s/"$//')
+
+  if [ -z "$client_email" ] || [ -z "$key_pem" ]; then
+    log_error "Could not parse client_email or private_key from Service Account JSON."
+    return 1
+  fi
+
+  local b64url_cmd='openssl base64 -e -A | tr "+/" "-_" | tr -d "="'
+  local now exp header_b64 claims claims_b64 unsigned_jwt sig_b64 jwt
+  now=$(date +%s)
+  exp=$((now + 3600))
+
+  header_b64=$(echo -n '{"alg":"RS256","typ":"JWT"}' | eval "$b64url_cmd")
+  claims="{\"iss\":\"$client_email\",\"scope\":\"https://www.googleapis.com/auth/drive\",\"aud\":\"$token_uri\",\"exp\":$exp,\"iat\":$now}"
+  claims_b64=$(echo -n "$claims" | eval "$b64url_cmd")
+
+  unsigned_jwt="${header_b64}.${claims_b64}"
+  sig_b64=$(printf "%s" "$unsigned_jwt" | openssl dgst -sha256 -sign <(printf '%b' "$key_pem") -binary 2>/dev/null | eval "$b64url_cmd")
+
+  if [ -z "$sig_b64" ]; then
+    log_error "Failed to sign Service Account JWT with openssl."
+    return 1
+  fi
+
+  jwt="${unsigned_jwt}.${sig_b64}"
+
+  local token_response
+  token_response=$(curl -s -X POST \
+    -d "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer" \
+    --data-urlencode "assertion=$jwt" \
+    "$token_uri")
+
+  echo "$token_response" | grep -o '"access_token": *"[^"]*"' | cut -d'"' -f4
+}
+
+is_gdrive_token_valid() {
+  local token="$1"
+  [ -z "$token" ] && return 1
+
+  local resp http_code exp
+  resp=$(curl -s --connect-timeout 5 --max-time 10 -w "\n%{http_code}" "https://oauth2.googleapis.com/tokeninfo?access_token=${token}" 2>/dev/null || true)
+  http_code=$(echo "$resp" | tail -n1)
+
+  if [ "$http_code" = "200" ]; then
+    exp=$(echo "$resp" | sed '$d' | grep -o '"expires_in": *"[^"]*"' | cut -d'"' -f4)
+    [ -z "$exp" ] && exp=$(echo "$resp" | sed '$d' | grep -o '"expires_in": *[0-9]*' | awk '{print $2}')
+    if [ -n "$exp" ] && [ "$exp" -gt 60 ] 2>/dev/null; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+resolve_gdrive_access_token() {
+  local current_token="$1"
+  local raw_access_token="$2"
+  local sa_input="$3"
+
+  if is_gdrive_token_valid "$current_token"; then
+    echo "$current_token"
+    return 0
+  fi
+
+  if [ -n "$sa_input" ]; then
+    get_gdrive_access_token_from_sa "$sa_input"
+  elif [ -n "$raw_access_token" ]; then
+    if [ -f "$raw_access_token" ]; then
+      if [[ "$raw_access_token" == *.json ]] || grep -q '"type": *"service_account"' "$raw_access_token" 2>/dev/null; then
+        get_gdrive_access_token_from_sa "$raw_access_token"
+      else
+        local file_tok
+        file_tok=$(tr -d '\r\n' < "$raw_access_token")
+        if is_gdrive_token_valid "$file_tok"; then
+          echo "$file_tok"
+        elif [ -n "$sa_input" ]; then
+          get_gdrive_access_token_from_sa "$sa_input"
+        else
+          echo "$file_tok"
+        fi
+      fi
+    elif [[ "$raw_access_token" =~ ^\{.*\}$ ]]; then
+      get_gdrive_access_token_from_sa "$raw_access_token"
+    else
+      echo "$raw_access_token"
+    fi
+  fi
+}
+
+cleanup_gdrive_old_snapshots() {
+  local access_token="$1"
+  local folder_id="$2"
+  local service_name="$3"
+  local max_backups="$4"
+  local raw_access_token="${5:-$access_token}"
+  local sa_input="$6"
+
+  if [ -z "$max_backups" ] || ! [[ "$max_backups" =~ ^[0-9]+$ ]] || [ "$max_backups" -le 0 ]; then
+    return 0
+  fi
+
+  local valid_token
+  valid_token=$(resolve_gdrive_access_token "$access_token" "$raw_access_token" "$sa_input")
+  [ -n "$valid_token" ] && access_token="$valid_token"
+
+  log_info "Running Google Drive lifecycle retention (keeping latest $max_backups snapshot(s) for $service_name)..."
+
+  local query
+  if [ -n "$folder_id" ]; then
+    query="'$folder_id' in parents and name contains 'snapshot-$service_name' and trashed = false"
+  else
+    query="name contains 'snapshot-$service_name' and trashed = false"
+  fi
+
+  local list_response
+  list_response=$(curl -s -X GET \
+    -H "Authorization: Bearer $access_token" \
+    "https://www.googleapis.com/drive/v3/files?q=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$query" 2>/dev/null || echo "")&orderBy=createdTime%20desc&fields=files(id,name,createdTime)")
+
+  local files_to_delete
+  files_to_delete=$(echo "$list_response" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    files = data.get('files', [])
+    if len(files) > $max_backups:
+        for f in files[$max_backups:]:
+            print(f['id'] + '\t' + f['name'])
+except Exception:
+    pass
+" 2>/dev/null || true)
+
+  if [ -n "$files_to_delete" ]; then
+    while IFS=$'\t' read -r file_id file_name; do
+      [ -z "$file_id" ] && continue
+      log_warn "Deleting old snapshot: $file_name ($file_id)..."
+      local del_status
+      del_status=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
+        -H "Authorization: Bearer $access_token" \
+        "https://www.googleapis.com/drive/v3/files/$file_id")
+      if [ "$del_status" = "204" ] || [ "$del_status" = "200" ]; then
+        log_success "Deleted old snapshot $file_name"
+      else
+        log_warn "Failed to delete old snapshot $file_name (HTTP $del_status)"
+      fi
+    done <<< "$files_to_delete"
+  fi
+}
+
+upload_to_gdrive_resumable() {
+  local file_path="$1"
+  local folder_id="$2"
+  local access_token="$3"
+  local chunk_size_mb="${4:-10}"
+  local raw_access_token="${5:-$access_token}"
+  local sa_input="$6"
+
+  local file_name file_size chunk_size
+  file_name=$(basename "$file_path")
+  file_size=$(stat -c%s "$file_path")
+  chunk_size=$((chunk_size_mb * 1024 * 1024))
+
+  log_info "Initiating resumable Google Drive upload for $file_name ($((file_size / 1024 / 1024)) MB)..."
+
+  local valid_token
+  valid_token=$(resolve_gdrive_access_token "$access_token" "$raw_access_token" "$sa_input")
+  [ -n "$valid_token" ] && access_token="$valid_token"
+
+  local metadata_json
+  if [ -n "$folder_id" ]; then
+    metadata_json="{\"name\":\"$file_name\",\"parents\":[\"$folder_id\"]}"
+  else
+    metadata_json="{\"name\":\"$file_name\"}"
+  fi
+
+  local init_response session_url
+  init_response=$(curl -s -i -X POST \
+    -H "Authorization: Bearer $access_token" \
+    -H "Content-Type: application/json; charset=UTF-8" \
+    -H "X-Upload-Content-Type: application/octet-stream" \
+    -H "X-Upload-Content-Length: $file_size" \
+    -d "$metadata_json" \
+    "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable")
+
+  session_url=$(echo "$init_response" | grep -i "^location:" | tr -d '\r' | awk '{print $2}')
+  if [ -z "$session_url" ]; then
+    log_error "Failed to initiate Google Drive upload session. Response: $init_response"
+    return 1
+  fi
+
+  local start_byte=0
+  local chunk_index=0
+  local total_chunks=$(( (file_size + chunk_size - 1) / chunk_size ))
+  [ "$total_chunks" -eq 0 ] && total_chunks=1
+
+  while [ "$start_byte" -lt "$file_size" ]; do
+    local end_byte=$((start_byte + chunk_size - 1))
+    [ "$end_byte" -ge "$file_size" ] && end_byte=$((file_size - 1))
+    local current_chunk_len=$((end_byte - start_byte + 1))
+    chunk_index=$((chunk_index + 1))
+
+    log_info "Uploading chunk #$chunk_index/$total_chunks ($((current_chunk_len / 1024 / 1024)) MB)..."
+
+    valid_token=$(resolve_gdrive_access_token "$access_token" "$raw_access_token" "$sa_input")
+    [ -n "$valid_token" ] && access_token="$valid_token"
+
+    local upload_response http_status
+    upload_response=$(dd if="$file_path" bs=1M skip=$((start_byte / 1024 / 1024)) count=$((current_chunk_len / 1024 / 1024 + 1)) 2>/dev/null | \
+      head -c "$current_chunk_len" | \
+      curl -s -w "\n%{http_code}" -X PUT \
+        -H "Authorization: Bearer $access_token" \
+        -H "Content-Range: bytes $start_byte-$end_byte/$file_size" \
+        --data-binary @- \
+        "$session_url")
+
+    http_status=$(echo "$upload_response" | tail -n1)
+
+    if [ "$http_status" = "308" ]; then
+      start_byte=$((end_byte + 1))
+    elif [ "$http_status" = "200" ] || [ "$http_status" = "201" ]; then
+      log_success "Google Drive upload complete: $file_name"
+      return 0
+    else
+      log_warn "Chunk upload received HTTP $http_status. Querying upload status..."
+      sleep 2
+      local status_response query_status last_byte
+      status_response=$(curl -s -i -X PUT \
+        -H "Authorization: Bearer $access_token" \
+        -H "Content-Range: bytes */$file_size" \
+        "$session_url")
+      query_status=$(echo "$status_response" | grep -i "^HTTP/" | tail -n1 | awk '{print $2}')
+      if [ "$query_status" = "308" ]; then
+        last_byte=$(echo "$status_response" | grep -i "^range:" | tr -d '\r' | awk -F'-' '{print $2}')
+        if [ -n "$last_byte" ]; then
+          start_byte=$((last_byte + 1))
+          chunk_index=$((start_byte / chunk_size))
+        fi
+      elif [ "$query_status" = "200" ] || [ "$query_status" = "201" ]; then
+        log_success "Google Drive upload was completed."
+        return 0
+      else
+        log_error "Google Drive upload failed at byte $start_byte (HTTP $http_status)."
+        return 1
+      fi
+    fi
+  done
+  return 0
+}
+
+# --- Remote Secondary VPS Snapshot Mode ---
+run_remote_snapshot() {
+  local host="$1"
+  local user="$2"
+  local port="${3:-22}"
+  local key="$4"
+  local compression_level="$5"
+
+  local this_vps clean_tgt
+  this_vps=$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo "vps-source")
+  clean_tgt=$(echo "$host" | sed -e 's|^.*://||' -e 's|^.*@||' -e 's|:.*$||' -e 's|/.*$||' -e 's|[^a-zA-Z0-9._-]|_|g')
+
+  if [ -z "$key" ]; then
+    if [ -f "$OWNER_HOME/.ssh/snapshot-${this_vps}-${clean_tgt}" ]; then
+      key="$OWNER_HOME/.ssh/snapshot-${this_vps}-${clean_tgt}"
+    else
+      key="$OWNER_HOME/.ssh/snapshot-${this_vps}-${clean_tgt}"
+    fi
+  fi
+  key="${key/#\~/$OWNER_HOME}"
+
+  local ssh_opts=(-p "$port" -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=5)
+  local rsync_ssh="ssh -p $port -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=5"
+  if [ -n "$key" ] && [ -f "$key" ]; then
+    ssh_opts+=(-i "$key")
+    rsync_ssh+=" -i $key"
+  fi
+
+  remote_exec() { ssh "${ssh_opts[@]}" "$user@$host" "$@"; }
+  remote_sync() { rsync -e "$rsync_ssh" "$@"; }
+
+  log_info "Connecting to Secondary VPS ($user@$host:$port)..."
+  if ! remote_exec "true" 2>/dev/null; then
+    log_error "Failed to establish SSH connection with Secondary VPS at $user@$host:$port."
+    exit 1
+  fi
+  log_success "SSH connection established with Secondary VPS."
+
+  local remote_home
+  remote_home=$(remote_exec 'echo "$HOME"' 2>/dev/null | tr -d '\r\n')
+  [ -z "$remote_home" ] && remote_home="/home/$user"
+
+  local remote_base="$remote_home/.wordpress-snapshots/$SERVICE_NAME"
+  local remote_staging="$remote_base/staging"
+  local remote_archives="$remote_base/archives"
+
+  log_info "Preparing directory structure on Secondary VPS under $remote_base/..."
+  remote_exec "mkdir -p '$remote_staging/tmp' '$remote_archives' && chmod 700 '$remote_home/.wordpress-snapshots'"
+
+  # Sync WordPress files
+  if [ -d "$PATH_TO_WP/data/wordpress" ]; then
+    log_info "Syncing data/wordpress to Secondary VPS..."
+    remote_sync -az --delete "$PATH_TO_WP/data/wordpress/" "$user@$host:$remote_staging/data/wordpress/"
+  fi
+
+  # Stream database dump directly to Secondary VPS
+  log_info "Streaming MySQL database dump directly to Secondary VPS..."
+  if ! run_mysql_dump "$WORDPRESS_DB_NAME" | remote_exec "cat > $remote_staging/tmp/dump.sql"; then
+    log_error "mysqldump stream to Secondary VPS failed."
+    exit 1
+  fi
+
+  # Sync configs
+  log_info "Syncing configuration files to Secondary VPS staging..."
+  local files_to_sync=()
+  [ -d "$PATH_TO_WP/.secrets" ] && files_to_sync+=("$PATH_TO_WP/.secrets")
+  [ -f "$PATH_TO_WP/.env" ] && files_to_sync+=("$PATH_TO_WP/.env")
+  [ -f "$PATH_TO_WP/docker-compose.yml" ] && files_to_sync+=("$PATH_TO_WP/docker-compose.yml")
+  [ -d "$PATH_TO_WP/php-config" ] && files_to_sync+=("$PATH_TO_WP/php-config")
+  [ -d "$PATH_TO_WP/nginx_sites_available_configurations" ] && files_to_sync+=("$PATH_TO_WP/nginx_sites_available_configurations")
+  [ -d "$PATH_TO_WP/scripts" ] && files_to_sync+=("$PATH_TO_WP/scripts")
+
+  if [ -n "$SNAPSHOT_CUSTOM_DIRS" ]; then
+    IFS=';' read -ra ADDR <<< "$SNAPSHOT_CUSTOM_DIRS"
+    for dir in "${ADDR[@]}"; do
+      dir=$(echo "$dir" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      [ -n "$dir" ] && [ -e "$dir" ] && files_to_sync+=("$dir")
+    done
+  fi
+
+  remote_sync -azR "${files_to_sync[@]}" "$user@$host:$remote_staging/"
+
+  # Generate manifest on secondary
+  local wp_version
+  wp_version=$(extract_wp_version)
+  remote_exec "cat <<'MANIFEST_EOF' > '$remote_staging/tmp/manifest.json'
+{
+  \"application\": \"wordpress\",
+  \"service_name\": \"$SERVICE_NAME\",
+  \"db_name\": \"$WORDPRESS_DB_NAME\",
+  \"wp_version\": \"$wp_version\",
+  \"created_at\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\"
+}
+MANIFEST_EOF"
+
+  local remote_tar_name="snapshot-$SERVICE_NAME.tar.zst"
+  local remote_tar_dest="$remote_archives/$remote_tar_name-$(date +"%Y%m%d-%H%M%S")"
+
+  log_info "Packaging and compressing snapshot on Secondary VPS using zstd -$compression_level..."
+  remote_exec "
+    mkdir -p '$remote_tar_dest'
+    tar -C '$remote_staging' -cf - . | zstd -${compression_level} -T0 > '$remote_tar_dest/$remote_tar_name'
+    chmod 644 '$remote_tar_dest/$remote_tar_name'
+    ln -sf '$remote_tar_dest/$remote_tar_name' '$remote_home/$remote_tar_name' 2>/dev/null || cp -f '$remote_tar_dest/$remote_tar_name' '$remote_home/$remote_tar_name'
+    rm -rf '$remote_staging'
+  "
+
+  log_success "Remote snapshot successfully archived on Secondary VPS at $remote_tar_dest/$remote_tar_name"
+}
+
+# --- Main Entry Point ---
+main() {
+  # Self-elevate to root if not already
+  if [ "$(id -u)" -ne 0 ]; then
+    exec sudo "$0" "$@"
+    exit 1
+  fi
+
+  # Acquire single execution lock
+  LOCK_FILE="/var/run/snapshot-$SERVICE_NAME.lock"
+  exec 200>"$LOCK_FILE"
+  if ! flock -n 200; then
+    local running_pid
+    running_pid=$(cat "$LOCK_FILE" 2>/dev/null || echo "unknown")
+    log_warn "Another snapshot instance for $SERVICE_NAME is already running (PID: $running_pid). Exiting."
+    exit 0
+  fi
+  echo "$$" > "$LOCK_FILE"
+
+  # Lower I/O and CPU scheduling priority
+  if command -v ionice >/dev/null 2>&1; then
+    ionice -c2 -n7 -p $$ 2>/dev/null || true
+  fi
+  renice -n 19 -p $$ >/dev/null 2>&1 || true
+
+  local WP_TMP_DIR="$OWNER_HOME/.wordpress-tmp/$SERVICE_NAME"
+  mkdir -p "$WP_TMP_DIR"
+  chmod 700 "$OWNER_HOME/.wordpress-tmp" "$WP_TMP_DIR" 2>/dev/null || true
+  chown -R "$REPOSITORY_OWNER":"$REPOSITORY_OWNER" "$OWNER_HOME/.wordpress-tmp" 2>/dev/null || true
+
+  local STAGING_DIR="$WP_TMP_DIR/snapshot_staging_$$"
+  local TAR_FILE_NAME="snapshot-$SERVICE_NAME.tar.zst"
+  local TAR_FILE_PATH="$WP_TMP_DIR/$TAR_FILE_NAME"
+
+  cleanup_temp_files() {
+    local exit_code=$?
+    rm -f "$LOCK_FILE" 2>/dev/null || true
+    rm -rf "$STAGING_DIR" 2>/dev/null || true
+    if [ $exit_code -ne 0 ] && [ -f "$TAR_FILE_PATH" ]; then
+      rm -f "$TAR_FILE_PATH"
+    fi
+  }
+  trap cleanup_temp_files EXIT
+
+  echo "-------------------------------------------------------------------------------"
+  echo " DAILY SNAPSHOT FOR $SERVICE_NAME @ $(date +"%A, %d %B %Y %H:%M %Z")"
+  echo "-------------------------------------------------------------------------------"
+
+  # Load configurations from .env
+  local ENV_FILE="$PATH_TO_WP/.env"
+  if [ ! -f "$ENV_FILE" ]; then
+    log_error ".env file not found at $ENV_FILE"
+    exit 1
+  fi
+
+  WORDPRESS_DB_NAME=$(grep "^WORDPRESS_DB_NAME=" "$ENV_FILE" 2>/dev/null | cut -d '=' -f2- | sed 's/[[:space:]]*#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^["'\'']//;s/["'\'']$//')
+  if [ -z "$WORDPRESS_DB_NAME" ]; then
+    log_error "WORDPRESS_DB_NAME is not set in .env!"
+    exit 1
+  fi
+
+  ASK_TO_REPLACE_EXISTING_SNAPSHOT=$(grep "^ASK_TO_REPLACE_EXISTING_SNAPSHOT=" "$ENV_FILE" 2>/dev/null | cut -d '=' -f2- | sed 's/[[:space:]]*#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^["'\'']//;s/["'\'']$//')
+  SNAPSHOT_CUSTOM_DIRS=$(grep "^SNAPSHOT_CUSTOM_DIRS=" "$ENV_FILE" 2>/dev/null | cut -d '=' -f2- | sed 's/[[:space:]]*#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^["'\'']//;s/["'\'']$//')
+  GCS_BUCKET_NAME=$(grep "^GCS_BUCKET_NAME=" "$ENV_FILE" 2>/dev/null | cut -d '=' -f2- | sed 's/[[:space:]]*#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^["'\'']//;s/["'\'']$//')
+
+  GDRIVE_ACCESS_TOKEN=$(grep "^GDRIVE_ACCESS_TOKEN=" "$ENV_FILE" 2>/dev/null | cut -d '=' -f2- | sed 's/[[:space:]]*#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^["'\'']//;s/["'\'']$//')
+  GDRIVE_SERVICE_ACCOUNT_KEY=$(grep "^GDRIVE_SERVICE_ACCOUNT_KEY=" "$ENV_FILE" 2>/dev/null | cut -d '=' -f2- | sed 's/[[:space:]]*#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^["'\'']//;s/["'\'']$//')
+  GDRIVE_FOLDER_ID=$(grep "^GDRIVE_FOLDER_ID=" "$ENV_FILE" 2>/dev/null | cut -d '=' -f2- | sed 's/[[:space:]]*#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^["'\'']//;s/["'\'']$//')
+  GDRIVE_CHUNK_SIZE=$(grep "^GDRIVE_CHUNK_SIZE=" "$ENV_FILE" 2>/dev/null | cut -d '=' -f2- | sed 's/[[:space:]]*#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^["'\'']//;s/["'\'']$//')
+  GDRIVE_MAX_BACKUPS=$(grep "^GDRIVE_MAX_BACKUPS=" "$ENV_FILE" 2>/dev/null | cut -d '=' -f2- | sed 's/[[:space:]]*#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^["'\'']//;s/["'\'']$//')
+  [ -z "$GDRIVE_MAX_BACKUPS" ] && GDRIVE_MAX_BACKUPS="7"
+  [ -z "$GDRIVE_CHUNK_SIZE" ] && GDRIVE_CHUNK_SIZE="10"
+
+  SNAPSHOT_COMPRESSION_LEVEL=$(grep "^SNAPSHOT_COMPRESSION_LEVEL=" "$ENV_FILE" 2>/dev/null | cut -d '=' -f2- | sed 's/[[:space:]]*#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^["'\'']//;s/["'\'']$//')
+  [ -z "$SNAPSHOT_COMPRESSION_LEVEL" ] && SNAPSHOT_COMPRESSION_LEVEL="7"
+
+  SNAPSHOT_REMOTE_HOST=$(grep "^SNAPSHOT_REMOTE_HOST=" "$ENV_FILE" 2>/dev/null | cut -d '=' -f2- | sed 's/[[:space:]]*#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^["'\'']//;s/["'\'']$//')
+  SNAPSHOT_REMOTE_USER=$(grep "^SNAPSHOT_REMOTE_USER=" "$ENV_FILE" 2>/dev/null | cut -d '=' -f2- | sed 's/[[:space:]]*#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^["'\'']//;s/["'\'']$//')
+  SNAPSHOT_REMOTE_PORT=$(grep "^SNAPSHOT_REMOTE_PORT=" "$ENV_FILE" 2>/dev/null | cut -d '=' -f2- | sed 's/[[:space:]]*#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^["'\'']//;s/["'\'']$//')
+  SNAPSHOT_REMOTE_KEY=$(grep "^SNAPSHOT_REMOTE_KEY=" "$ENV_FILE" 2>/dev/null | cut -d '=' -f2- | sed 's/[[:space:]]*#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^["'\'']//;s/["'\'']$//')
+  [ -z "$SNAPSHOT_REMOTE_PORT" ] && SNAPSHOT_REMOTE_PORT="22"
+
+  # --- Branch: Remote Secondary VPS Mode ---
+  if [ -n "$SNAPSHOT_REMOTE_HOST" ]; then
+    if [ -z "$SNAPSHOT_REMOTE_USER" ]; then
+      log_error "SNAPSHOT_REMOTE_USER is required when SNAPSHOT_REMOTE_HOST is set!"
+      exit 1
+    fi
+    log_info "Executing snapshot in Remote Secondary VPS Mode ($SNAPSHOT_REMOTE_USER@$SNAPSHOT_REMOTE_HOST)..."
+    run_remote_snapshot "$SNAPSHOT_REMOTE_HOST" "$SNAPSHOT_REMOTE_USER" "$SNAPSHOT_REMOTE_PORT" "$SNAPSHOT_REMOTE_KEY" "$SNAPSHOT_COMPRESSION_LEVEL"
+    return 0
+  fi
+
+  # --- Branch: Local Snapshot Mode ---
+  if ! command -v zstd >/dev/null 2>&1; then
+    log_error "zstd is not installed. Please install with: sudo apt install zstd"
+    exit 1
+  fi
+
+  areYouReallySure "$TAR_FILE_PATH" "$ASK_TO_REPLACE_EXISTING_SNAPSHOT"
+
+  rm -rf "$STAGING_DIR"
+  mkdir -p "$STAGING_DIR"
+
+  log_info "Dumping MySQL database '$WORDPRESS_DB_NAME'..."
+  if ! run_mysql_dump "$WORDPRESS_DB_NAME" > "$STAGING_DIR/dump.sql"; then
+    log_error "mysqldump failed."
+    exit 1
+  fi
+  log_success "MySQL database dump completed."
+
+  log_info "Generating manifest and metadata..."
+  local wp_version
+  wp_version=$(extract_wp_version)
+  cat <<EOF > "$STAGING_DIR/manifest.json"
+{
+  "application": "wordpress",
+  "service_name": "$SERVICE_NAME",
+  "db_name": "$WORDPRESS_DB_NAME",
+  "wp_version": "$wp_version",
+  "created_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+}
+EOF
+
+  writeGitHash "$PATH_TO_WP" "$STAGING_DIR/git_hashes.txt"
+
+  log_info "Staging WordPress data and configuration files..."
+  local files_to_tar=()
+  [ -f "$STAGING_DIR/dump.sql" ] && files_to_tar+=("$STAGING_DIR/dump.sql")
+  [ -f "$STAGING_DIR/manifest.json" ] && files_to_tar+=("$STAGING_DIR/manifest.json")
+  [ -f "$STAGING_DIR/git_hashes.txt" ] && files_to_tar+=("$STAGING_DIR/git_hashes.txt")
+
+  # Include WordPress persistent files
+  [ -d "$PATH_TO_WP/data/wordpress" ] && files_to_tar+=("$PATH_TO_WP/data/wordpress")
+
+  # Include configuration files
+  [ -d "$PATH_TO_WP/.secrets" ] && files_to_tar+=("$PATH_TO_WP/.secrets")
+  [ -f "$PATH_TO_WP/.env" ] && files_to_tar+=("$PATH_TO_WP/.env")
+  [ -f "$PATH_TO_WP/docker-compose.yml" ] && files_to_tar+=("$PATH_TO_WP/docker-compose.yml")
+  [ -d "$PATH_TO_WP/php-config" ] && files_to_tar+=("$PATH_TO_WP/php-config")
+  [ -d "$PATH_TO_WP/nginx_sites_available_configurations" ] && files_to_tar+=("$PATH_TO_WP/nginx_sites_available_configurations")
+  [ -d "$PATH_TO_WP/scripts" ] && files_to_tar+=("$PATH_TO_WP/scripts")
+
+  if [ -n "$SNAPSHOT_CUSTOM_DIRS" ]; then
+    IFS=';' read -ra ADDR <<< "$SNAPSHOT_CUSTOM_DIRS"
+    for dir in "${ADDR[@]}"; do
+      dir=$(echo "$dir" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+      [ -n "$dir" ] && [ -e "$dir" ] && files_to_tar+=("$dir")
+    done
+  fi
+
+  log_info "Creating snapshot archive $TAR_FILE_NAME (compression level: $SNAPSHOT_COMPRESSION_LEVEL)..."
+  tar --transform "s|^$STAGING_DIR/||" \
+      --transform "s|^${PATH_TO_WP#/}/||" \
+      --transform "s|^$PATH_TO_WP/||" \
+      -cf - "${files_to_tar[@]}" | zstd "-$SNAPSHOT_COMPRESSION_LEVEL" -T0 > "$TAR_FILE_PATH"
+
+  chmod 644 "$TAR_FILE_PATH"
+  chown "$REPOSITORY_OWNER":"$REPOSITORY_OWNER" "$TAR_FILE_PATH" 2>/dev/null || true
+
+  # Move to archive directory
+  moveSnapshotFileToTempDir "$TAR_FILE_PATH" "$TAR_FILE_NAME"
+
+  local final_snapshot="$OWNER_HOME/$TAR_FILE_NAME"
+
+  # Google Cloud Storage Upload
+  if [ -n "$GCS_BUCKET_NAME" ]; then
+    log_info "Uploading snapshot to Google Cloud Storage (gs://$GCS_BUCKET_NAME)..."
+    if command -v gcloud >/dev/null 2>&1; then
+      if gcloud storage cp "$final_snapshot" "gs://$GCS_BUCKET_NAME/$TAR_FILE_NAME-$(date +"%Y%m%d-%H%M%S")" 2>&1; then
+        log_success "Snapshot uploaded to Google Cloud Storage."
+      else
+        log_warn "Failed to upload snapshot to Google Cloud Storage."
+      fi
+    else
+      log_warn "gcloud CLI not installed. Skipping GCS upload."
+    fi
+  fi
+
+  # Google Drive Upload
+  if [ -n "$GDRIVE_ACCESS_TOKEN" ] || [ -n "$GDRIVE_SERVICE_ACCOUNT_KEY" ]; then
+    log_info "Uploading snapshot to Google Drive..."
+    local gdrive_token
+    gdrive_token=$(resolve_gdrive_access_token "$GDRIVE_ACCESS_TOKEN" "$GDRIVE_ACCESS_TOKEN" "$GDRIVE_SERVICE_ACCOUNT_KEY")
+    if [ -n "$gdrive_token" ]; then
+      if upload_to_gdrive_resumable "$final_snapshot" "$GDRIVE_FOLDER_ID" "$gdrive_token" "$GDRIVE_CHUNK_SIZE" "$GDRIVE_ACCESS_TOKEN" "$GDRIVE_SERVICE_ACCOUNT_KEY"; then
+        cleanup_gdrive_old_snapshots "$gdrive_token" "$GDRIVE_FOLDER_ID" "$SERVICE_NAME" "$GDRIVE_MAX_BACKUPS" "$GDRIVE_ACCESS_TOKEN" "$GDRIVE_SERVICE_ACCOUNT_KEY"
+      fi
+    else
+      log_warn "Could not obtain valid Google Drive access token. Skipping GDrive upload."
+    fi
+  fi
+
+  log_success "Snapshot process for $SERVICE_NAME completed successfully."
+}
+
+main "$@"

@@ -9,25 +9,25 @@ function getDate() {
 function main() {
   CURRENT_DIR=$(dirname "$(readlink -f "$0")")
   CURRENT_DIR_USER=$(stat -c '%U' "$CURRENT_DIR")
-  PATH_TO_ODOO=$(sudo -u "$CURRENT_DIR_USER" git -C "$(dirname "$(readlink -f "$0")")" rev-parse --show-toplevel)
-  SERVICE_NAME=$(basename "$PATH_TO_ODOO")
-  REPOSITORY_OWNER=$(stat -c '%U' "$PATH_TO_ODOO")
+  PATH_TO_WP=$(sudo -u "$CURRENT_DIR_USER" git -C "$(dirname "$(readlink -f "$0")")" rev-parse --show-toplevel 2>/dev/null || git -C "$(dirname "$(readlink -f "$0")")" rev-parse --show-toplevel 2>/dev/null || dirname "$CURRENT_DIR")
+  SERVICE_NAME=$(basename "$PATH_TO_WP")
+  REPOSITORY_OWNER=$(stat -c '%U' "$PATH_TO_WP" 2>/dev/null || echo "$USER")
 
   echo "-------------------------------------------------------------------------------"
   echo " UPDATE ENV FILE FOR $SERVICE_NAME @ $(date +"%A, %d %B %Y %H:%M %Z")"
   echo "-------------------------------------------------------------------------------"
 
-  echo "$(getDate) Path to Odoo: $PATH_TO_ODOO"
-  cd "$PATH_TO_ODOO" || exit 1
+  echo "$(getDate) Path to WordPress: $PATH_TO_WP"
+  cd "$PATH_TO_WP" || exit 1
 
-  if [ -f "$PATH_TO_ODOO/.env" ]; then
+  if [ -f "$PATH_TO_WP/.env" ]; then
     echo "$(getDate) Backup current .env file"
     cp .env .env.bak
   else
     echo "$(getDate) .env file not found. Backup skipped"
   fi
 
-  if [ -f "$PATH_TO_ODOO/.env.example" ]; then
+  if [ -f "$PATH_TO_WP/.env.example" ]; then
     echo "$(getDate) Copy .env.example to .env"
     cp .env.example .env
   else

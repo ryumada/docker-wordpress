@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+set -e
+# Category: Utility
+# Description: Restores WordPress database and data files from a backupdata zip archive.
+# Usage: ./scripts/restore_backupdata-SERVICE_NAME.sh [BACKUP_FILE] [-n DB_NAME] [-y]
+# Dependencies: 7z, docker, sudo, git
+
+CURRENT_DIR=$(dirname "$(readlink -f "$0")")
+CURRENT_DIR_USER=$(stat -c '%U' "$CURRENT_DIR")
+PATH_TO_WP=$(sudo -u "$CURRENT_DIR_USER" git -C "$(dirname "$(readlink -f "$0")")" rev-parse --show-toplevel 2>/dev/null || git -C "$(dirname "$(readlink -f "$0")")" rev-parse --show-toplevel 2>/dev/null || dirname "$CURRENT_DIR")
+SERVICE_NAME=$(basename "$PATH_TO_WP")
+REPOSITORY_OWNER=$(stat -c '%U' "$PATH_TO_WP" 2>/dev/null || echo "$USER")
+OWNER_HOME=$(eval echo "~$REPOSITORY_OWNER" 2>/dev/null || echo "$HOME")
+[ -z "$OWNER_HOME" ] && OWNER_HOME="$HOME"
+
+# Source helper libraries if available
+if [ -f "$CURRENT_DIR/lib/wp_utils.sh" ]; then
+  # shellcheck source=/dev/null
+  source "$CURRENT_DIR/lib/wp_utils.sh"
+elif [ -f "$PATH_TO_WP/scripts/lib/wp_utils.sh" ]; then
+  # shellcheck source=/dev/null
+  source "$PATH_TO_WP/scripts/lib/wp_utils.sh"
+fi
+
+# --- Logging Functions & Colors ---
+COLOR_RESET="\033[0m"
+COLOR_INFO="\033[0;34m"
+COLOR_SUCCESS="\033[0;32m"
+COLOR_WARN="\033[1;33m"
+COLOR_ERROR="\033[0;31m"
+
+log() {
+  local color="$1"
+  local emoji="$2"
+  local message="$3"
+  echo -e "${color}[$(date +"%Y-%m-%d %H:%M:%S")] ${emoji} ${message}${COLOR_RESET}"
+}
+
+log_info() { log "${COLOR_INFO}" "ℹ️" "$1"; }
+log_success() { log "${COLOR_SUCCESS}" "✅" "$1"; }
+log_warn() { log "${COLOR_WARN}" "⚠️" "$1"; }
+log_error() { log "${COLOR_ERROR}" "❌" "$1"; }
+
+show_help() {
+  cat << EOF
+Usage: $(basename "$0") [OPTIONS] [BACKUP_FILE]
+
+Restores WordPress database and data files from a backupdata (.zip) archive.
+
+Options:
+  -n, --name, --dbname <NAME>    Override target MySQL database name
+  -y, --yes, --force             Skip confirmation prompt
+  -h, --help                     Show this help message
+
+Arguments:
+  BACKUP_FILE                    Path to backup zip archive (default: ~/backupdata-$SERVICE_NAME.zip)
+
+Examples:
+  ./scripts/restore_backupdata-$SERVICE_NAME.sh
+  ./scripts/restore_backupdata-$SERVICE_NAME.sh ~/my-backup.zip -n custom_wp_db -y
+EOF
+}
+
+# --- Database Operations ---
+is_mysql_container_running() {
+  local compose_file="$PATH_TO_WP/docker-compose.yml"
+  [ ! -f "$compose_file" ] && return 1
+  local cid
+  cid=$(docker compose -f "$compose_file" ps -q db 2>/dev/null || true)
+  if [ -n "$cid" ] && [ "$(docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)" = "true" ]; then
+    return 0
+  fi
+  return 1
+}
+
+ensure_mysql_container_running() {
+  local compose_file="$PATH_TO_WP/docker-compose.yml"
+  if ! is_mysql_container_running; then
+    log_info "Starting database container 'db'..."
+    docker compose -f "$compose_file" up -d db
+    log_info "Waiting for MySQL database service to become ready..."
+    local attempts=0
+    local max_attempts=30
+    while [ $attempts -lt $max_attempts ]; do
+      if docker compose -f "$compose_file" exec -T db sh -c 'mysqladmin ping -h localhost --silent' 2>/dev/null; then
+        log_success "MySQL database is ready."
+        return 0
+      fi
+      sleep 2
+      attempts=$((attempts + 1))
+    done
+    log_error "MySQL database did not become ready in time."
+    return 1
+  fi
+  return 0
+}
+
+run_mysql_restore() {
+  local target_db="$1"
+  local sql_file="$2"
+  local compose_file="$PATH_TO_WP/docker-compose.yml"
+  local env_file="$PATH_TO_WP/.env"
+
+  local db_user
+  db_user=$(grep "^WORDPRESS_DB_USER=" "$env_file" 2>/dev/null | cut -d '=' -f2- | sed 's/[[:space:]]*#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^["'\'']//;s/["'\'']$//')
+  [ -z "$db_user" ] && db_user="wordpress"
+
+  ensure_mysql_container_running
+
+  log_info "Creating database '$target_db' if it does not exist..."
+  docker compose -f "$compose_file" exec -T db sh -c '
+    if [ -f /run/secrets/db_password ]; then
+      PASS=$(cat /run/secrets/db_password)
+    else
+      PASS="$MYSQL_PASSWORD"
+    fi
+    MYSQL_PWD="$PASS" exec mysql -u "'"$db_user"'" -e "CREATE DATABASE IF NOT EXISTS \`'"$target_db"'\`;"
+  '
+
+  log_info "Importing SQL dump into '$target_db'..."
+  docker compose -f "$compose_file" exec -T db sh -c '
+    if [ -f /run/secrets/db_password ]; then
+      PASS=$(cat /run/secrets/db_password)
+    else
+      PASS="$MYSQL_PASSWORD"
+    fi
+    MYSQL_PWD="$PASS" exec mysql -u "'"$db_user"'" "'"$target_db"'"
+  ' < "$sql_file"
+}
+
+main() {
+  # Handle help flag
+  for arg in "$@"; do
+    if [ "$arg" = "-h" ] || [ "$arg" = "--help" ]; then
+      show_help
+      exit 0
+    fi
+  done
+
+  # Self-elevate to root if not already
+  if [ "$(id -u)" -ne 0 ]; then
+    exec sudo "$0" "$@"
+    exit 1
+  fi
+
+  local TARGET_DB=""
+  local BACKUP_FILE=""
+  local AUTO_CONFIRM=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -n|--name|--dbname)
+        TARGET_DB="$2"
+        shift 2
+        ;;
+      --dbname=*|--name=*)
+        TARGET_DB="${1#*=}"
+        shift
+        ;;
+      -y|--yes|--force)
+        AUTO_CONFIRM=true
+        shift
+        ;;
+      *)
+        if [ -z "$BACKUP_FILE" ]; then
+          BACKUP_FILE="$1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  if [ -z "$BACKUP_FILE" ]; then
+    BACKUP_FILE="$OWNER_HOME/backupdata-$SERVICE_NAME.zip"
+  fi
+
+  if [ ! -f "$BACKUP_FILE" ]; then
+    log_error "Backup file not found at: $BACKUP_FILE"
+    exit 1
+  fi
+
+  local ENV_FILE="$PATH_TO_WP/.env"
+  if [ -z "$TARGET_DB" ] && [ -f "$ENV_FILE" ]; then
+    TARGET_DB=$(grep "^WORDPRESS_DB_NAME=" "$ENV_FILE" 2>/dev/null | cut -d '=' -f2- | sed 's/[[:space:]]*#.*//' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^["'\'']//;s/["'\'']$//')
+  fi
+
+  if [ -z "$TARGET_DB" ]; then
+    read -rp "Enter destination database name: " TARGET_DB
+  fi
+
+  if [ "$AUTO_CONFIRM" != true ]; then
+    log_warn "This operation will overwrite database '$TARGET_DB' and files in $PATH_TO_WP/data/wordpress."
+    read -rp "Are you sure you want to proceed? [y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+      log_info "Operation cancelled by user."
+      exit 0
+    fi
+  fi
+
+  local zip_cmd="7z"
+  if ! command -v 7z >/dev/null 2>&1; then
+    if command -v 7za >/dev/null 2>&1; then
+      zip_cmd="7za"
+    else
+      log_error "7z command not found. Install with: sudo apt install 7zip || sudo apt install p7zip-full"
+      exit 1
+    fi
+  fi
+
+  local WP_TMP_DIR="$OWNER_HOME/.wordpress-tmp/$SERVICE_NAME"
+  local EXTRACT_DIR="$WP_TMP_DIR/restore_backupdata_staging_$$"
+  mkdir -p "$EXTRACT_DIR"
+
+  cleanup_staging() {
+    rm -rf "$EXTRACT_DIR" 2>/dev/null || true
+  }
+  trap cleanup_staging EXIT
+
+  log_info "Extracting backup archive $BACKUP_FILE..."
+  "$zip_cmd" x -y -o"$EXTRACT_DIR" "$BACKUP_FILE" >/dev/null
+
+  if [ -f "$EXTRACT_DIR/dump.sql" ]; then
+    log_info "Restoring MySQL database to '$TARGET_DB'..."
+    run_mysql_restore "$TARGET_DB" "$EXTRACT_DIR/dump.sql"
+    log_success "Database restore completed."
+  else
+    log_warn "No dump.sql found in archive."
+  fi
+
+  if [ -d "$EXTRACT_DIR/wordpress" ]; then
+    log_info "Restoring WordPress data directory to $PATH_TO_WP/data/wordpress..."
+    mkdir -p "$PATH_TO_WP/data/wordpress"
+    rsync -a --delete "$EXTRACT_DIR/wordpress/" "$PATH_TO_WP/data/wordpress/"
+    chown -R "$REPOSITORY_OWNER":"$REPOSITORY_OWNER" "$PATH_TO_WP/data/wordpress" 2>/dev/null || true
+    log_success "WordPress files restored."
+  fi
+
+  log_success "Backup data restored successfully from $BACKUP_FILE"
+}
+
+main "$@"

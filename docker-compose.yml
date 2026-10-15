@@ -14,7 +14,7 @@ services:
       WORDPRESS_DB_HOST: db
       WORDPRESS_DB_NAME: $WORDPRESS_DB_NAME
       WORDPRESS_DB_USER: $WORDPRESS_DB_USER
-      WORDPRESS_DB_PASSWORD: $(cat /run/secrets/db_password)
+      WORDPRESS_DB_PASSWORD_FILE: /run/secrets/db_password
     env_file:
       - .env
     volumes:
@@ -30,11 +30,40 @@ services:
       MYSQL_DATABASE: $WORDPRESS_DB_NAME
       MYSQL_USER: $WORDPRESS_DB_USER
       MYSQL_PASSWORD: $(cat /run/secrets/db_password)
+      MYSQL_PASSWORD_FILE: /run/secrets/db_password
       MYSQL_RANDOM_ROOT_PASSWORD: '1'
     env_file:
       - .env
     volumes:
       - ./data/db:/var/lib/mysql
+    secrets:
+      - db_password
+
+  # Adminer is highly recommended for Docker: lightweight and fast.
+  # Access it at http://localhost:8080 (Login with Server: db)
+  # adminer:
+  #   image: adminer:latest
+  #   restart: always
+  #   ports:
+  #     - 8080:8080
+  #   environment:
+  #     ADMINER_DEFAULT_SERVER: db
+  #   depends_on:
+  #     - db
+
+  # phpMyAdmin alternative (Uncomment if you prefer this over Adminer)
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin
+    restart: always
+    ports:
+      - "8080:80"
+    environment:
+      PMA_HOST: db # Connects to the 'db' service defined above
+      PMA_PMADB: phpmyadmin
+      PMA_USER: $WORDPRESS_DB_USER
+      PMA_PASSWORD_FILE: /run/secrets/db_password
+    depends_on:
+      - db # Ensures the database starts first
     secrets:
       - db_password
 
